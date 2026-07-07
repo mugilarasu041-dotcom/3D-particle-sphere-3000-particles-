@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Particle Sphere</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a0b;
+    overflow: hidden;
+    font-family: -apple-system, sans-serif;
+    color: #e0e0e0;
+    width: 100vw;
+    height: 100vh;
+  }
+  #webcam {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw;
+    height: 100vh;
+    object-fit: cover;
+    transform: scaleX(-1);
+    opacity: 0;
+    transition: opacity 0.5s ease;
+    z-index: 0;
+    pointer-events: none;
+  }
+  body.bg-mode #webcam { opacity: 0.4; }
+  body.bg-mode { background: #000; }
+  #canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 1;
+  }
+  #ui {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    padding: 28px 36px;
+    z-index: 10;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    pointer-events: none;
+  }
+  #ui > * { pointer-events: auto; }
+  h1 {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 22px;
+    font-weight: 400;
+    letter-spacing: 0.5px;
+    color: #f0f0f0;
+    text-shadow: 0 1px 8px rgba(0,0,0,0.6);
+  }
+  #toggleBg {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    color: #ccc;
+    padding: 8px 18px;
+    border-radius: 20px;
+    font-size: 13px;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    transition: all 0.3s;
+  }
+  #toggleBg:hover {
+    background: rgba(255,255,255,0.12);
+    color: #fff;
+  }
+  #status {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    font-size: 12px;
+    color: rgba(255,255,255,0.4);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  #loading {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 100;
+    font-family: Georgia, serif;
+    font-size: 16px;
+    color: rgba(255,255,255,0.5);
+  }
+</style>
+</head>
+<body>
+<video id="webcam" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <h1>Particle Sphere</h1>
+  <button id="toggleBg">Toggle Background</button>
+</div>
+<div id="status">Initializing…</div>
+<div id="loading">Loading hand tracking model…</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js"></script>
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const video = document.getElementById('webcam');
+  const status = document.getElementById('status');
+  const loading = document.getElementById('loading');
+  const toggleBtn = document.getElementById('toggleBg');
+
+  let W, H;
+  function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // Toggle background
+  toggleBtn.addEventListener('click', () => {
+    document.body.classList.toggle('bg-mode');
+  });
+
+  // --- Particles ---
+  const NUM = 3000;
+  const particles = [];
+  for (let i = 0; i < NUM; i++) {
+    const phi = Math.acos(1 - 2 * (i + 0.5) / NUM);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+    particles.push({
+      bx: Math.sin(phi) * Math.cos(theta),
+      by: Math.sin(phi) * Math.sin(theta),
+      bz: Math.cos(phi),
+      x: 0, y: 0, z: 0,
+      vx: 0, vy: 0, vz: 0,
+      life: 1
+    });
+  }
+
+  // --- State ---
+  let sphereRadius = 180;
+  let targetRadius = 180;
+  let sphereX = 0, sphereY = 0;
+  let targetSphereX = 0, targetSphereY = 0;
+  let rotX = 0, rotY = 0;
+  let rotSpeedX = 0.002, rotSpeedY = 0.004;
+  let charge = 0;
+  let isPinching = false;
+  let wasPinching = false;
+  let fingerCount = 5;
+  let handCount = 0;
+  let explosionTimer = 0;
+  let hue = 200;
+  let targetHue = 200;
+  let handsData = null;
+
+  // --- Hand Tracking ---
+  function countFingers(landmarks, handedness) {
+    let count = 0;
+    const isRight = handedness === 'Right';
+    // Thumb: tip (4) vs IP (3) — compare x relative to hand direction
+    const thumbTip = landmarks[4];
+    const thumbIP = landmarks[3];
+    const wrist = landmarks[0];
+    const indexMCP = landmarks[5];
+    // Determine hand facing: if right hand (mirrored), thumb extends left
+    if (isRight) {
+      if (thumbTip.x < thumbIP.x) count++;
+    } else {
+      if (thumbTip.x > thumbIP.x) count++;
+    }
+    // Other fingers: tip above PIP (y smaller = higher in image)
+    const tips = [8, 12, 16, 20];
+    const pips = [6, 10, 14, 18];
+    for (let i = 0; i < 4; i++) {
+      if (landmarks[tips[i]].y < landmarks[pips[i]].y) count++;
+    }
+    return count;
+  }
+
+  function getPinchDist(landmarks) {
+    const thumb = landmarks[4];
+    const index = landmarks[8];
+    const dx = thumb.x - index.x;
+    const dy = thumb.y - index.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function getHandCenter(landmarks) {
+    let x = 0, y = 0;
+    const indices = [0, 5, 9, 13, 17];
+    for (const i of indices) { x += landmarks[i].x; y += landmarks[i].y; }
+    return { x: x / indices.length, y: y / indices.length };
+  }
+
+  function onResults(results) {
+    loading.style.display = 'none';
+    handsData = results;
+    const lm = results.multiHandLandmarks;
+    const hh = results.multiHandedness;
+
+    if (!lm || lm.length === 0) {
+      handCount = 0;
+      status.textContent = 'Show your hand';
+      return;
+    }
+
+    handCount = lm.length;
+    let totalFingers = 0;
+
+    if (handCount === 1) {
+      const landmarks = lm[0];
+      const handedness = hh[0].label;
+      totalFingers = countFingers(landmarks, handedness);
+      fingerCount = totalFingers;
+
+      const center = getHandCenter(landmarks);
+      // Mirror x for display
+      targetSphereX = (1 - center.x - 0.5) * W * 0.6;
+      targetSphereY = (center.y - 0.5) * H * 0.6;
+
+      const pinchDist = getPinchDist(landmarks);
+      isPinching = pinchDist < 0.06;
+
+      if (isPinching) {
+        status.textContent = `Pinching… Charge: ${Math.floor(charge * 100)}%`;
+      } else {
+        status.textContent = `${totalFingers} finger${totalFingers !== 1 ? 's' : ''} · Moving`;
+      }
+
+      // Rotation influence from hand movement
+      rotSpeedY = 0.004 + (center.x - 0.5) * 0.02;
+      rotSpeedX = 0.002 + (center.y - 0.5) * 0.01;
+
+    } else if (handCount === 2) {
+      const c0 = getHandCenter(lm[0]);
+      const c1 = getHandCenter(lm[1]);
+      const dist = Math.sqrt((c0.x - c1.x) ** 2 + (c0.y - c1.y) ** 2);
+      targetRadius = 100 + dist * 500;
+      targetRadius = Math.max(80, Math.min(350, targetRadius));
+
+      totalFingers = countFingers(lm[0], hh[0].label) + countFingers(lm[1], hh[1].label);
+      fingerCount = totalFingers;
+
+      targetSphereX = ((1 - (c0.x + c1.x) / 2) - 0.5) * W * 0.4;
+      targetSphereY = ((c0.y + c1.y) / 2 - 0.5) * H * 0.4;
+
+      status.textContent = `Two hands · ${totalFingers} fingers · Radius: ${Math.floor(targetRadius)}`;
+      isPinching = false;
+    }
+  }
+
+  // Init MediaPipe
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+  });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.5
+  });
+  hands.onResults(onResults);
+
+  const camera = new Camera(video, {
+    onFrame: async () => {
+      await hands.send({ image: video });
+    },
+    width: 640,
+    height: 480
+  });
+  camera.start();
+
+  // --- Color from finger count ---
+  function getFingerColor(count, alpha) {
+    const hues = [0, 20, 45, 60, 120, 180, 200, 240, 280, 320, 340];
+    const h = hues[Math.min(count, 10)];
+    return `hsla(${h}, 80%, 65%, ${alpha})`;
+  }
+
+  // --- 3D Projection ---
+  const FOV = 500;
+  function project(x, y, z) {
+    const scale = FOV / (FOV + z);
+    return {
+      x: x * scale + W / 2 + sphereX,
+      y: y * scale + H / 2 + sphereY,
+      scale: scale
+    };
+  }
+
+  function rotatePoint(bx, by, bz) {
+    // Rotate Y
+    let x = bx * Math.cos(rotY) - bz * Math.sin(rotY);
+    let z = bx * Math.sin(rotY) + bz * Math.cos(rotY);
+    let y = by;
+    // Rotate X
+    let y2 = y * Math.cos(rotX) - z * Math.sin(rotX);
+    let z2 = y * Math.sin(rotX) + z * Math.cos(rotX);
+    return { x: x * sphereRadius, y: y2 * sphereRadius, z: z2 * sphereRadius };
+  }
+
+  // --- Animation ---
+  let lastTime = performance.now();
+
+  function animate(now) {
+    const dt = Math.min((now - lastTime) / 16.67, 3);
+    lastTime = now;
+
+    // Smooth sphere position
+    sphereX += (targetSphereX - sphereX) * 0.08 * dt;
+    sphereY += (targetSphereY - sphereY) * 0.08 * dt;
+    sphereRadius += (targetRadius - sphereRadius) * 0.06 * dt;
+
+    // Rotation
+    rotX += rotSpeedX * dt;
+    rotY += rotSpeedY * dt;
+
+    // Pinch / charge logic
+    if (handCount >= 1) {
+      if (isPinching) {
+        charge = Math.min(1, charge + 0.012 * dt);
+      }
+      if (wasPinching && !isPinching && charge > 0.05) {
+        // Trigger explosion
+        triggerExplosion();
+        charge = 0;
+      }
+      wasPinching = isPinching;
+    } else {
+      wasPinching = false;
+      charge *= 0.95;
+    }
+
+    // Color
+    const hues = [0, 20, 45, 60, 120, 180, 200, 240, 280, 320, 340];
+    targetHue = hues[Math.min(fingerCount, 10)];
+    hue += (targetHue - hue) * 0.05 * dt;
+
+    // Explosion timer
+    if (explosionTimer > 0) {
+      explosionTimer -= 0.015 * dt;
+      if (explosionTimer < 0) explosionTimer = 0;
+    }
+
+    // Clear
+    ctx.fillStyle = document.body.classList.contains('bg-mode')
+      ? 'rgba(0,0,0,0.15)' : 'rgba(10,10,11,0.25)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Draw charge ring
+    if (charge > 0.01) {
+      drawChargeRing();
+    }
+
+    // Update and draw particles
+    const sorted = [];
+    for (let i = 0; i < NUM; i++) {
+      const p = particles[i];
+      const rotated = rotatePoint(p.bx, p.by, p.bz);
+
+      if (explosionTimer > 0) {
+        const explodeFactor = explosionTimer;
+        const returnFactor = 1 - explosionTimer;
+        // Add explosion velocity
+        if (p.life >= 1) {
+          const angle1 = Math.random() * Math.PI * 2;
+          const angle2 = Math.random() * Math.PI * 2;
+          const speed = 3 + Math.random() * 8;
+          p.vx = Math.cos(angle1) * Math.sin(angle2) * speed;
+          p.vy = Math.sin(angle1) * Math.sin(angle2) * speed;
+          p.vz = Math.cos(angle2) * speed;
+          p.life = 0.99;
+        }
+        p.x = rotated.x + p.vx * explodeFactor * 60;
+        p.y = rotated.y + p.vy * explodeFactor * 60;
+        p.z = rotated.z + p.vz * explodeFactor * 60;
+        p.vx *= 0.97;
+        p.vy *= 0.97;
+        p.vz *= 0.97;
+        if (explodeFactor < 0.3) {
+          p.life = 1;
+        }
+      } else {
+        p.x = rotated.x;
+        p.y = rotated.y;
+        p.z = rotated.z;
+        p.life = 1;
+        p.vx = p.vy = p.vz = 0;
+      }
+
+      sorted.push({ i, z: p.z });
+    }
+
+    // Sort back to front
+    sorted.sort((a, b) => a.z - b.z);
+
+    for (const s of sorted) {
+      const p = particles[s.i];
+      const proj = project(p.x, p.y, p.z);
+      const size = Math.max(0.5, 2.2 * proj.scale);
+      const depthAlpha = 0.3 + 0.7 * proj.scale;
+      const alpha = depthAlpha * (p.life > 0.5 ? 1 : p.life * 2);
+
+      ctx.beginPath();
+      ctx.arc(proj.x, proj.y, size, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${hue}, 80%, ${55 + proj.scale * 15}%, ${alpha})`;
+      ctx.fill();
+    }
+
+    requestAnimationFrame(animate);
+  }
+
+  function triggerExplosion() {
+    explosionTimer = 1.0;
+    for (const p of particles) {
+      p.life = 1;
+    }
+  }
+
+  function drawChargeRing() {
+    const cx = W / 2 + sphereX;
+    const cy = H / 2 + sphereY;
+    const radius = sphereRadius + 30;
+    const startAngle = -Math.PI / 2;
+    const endAngle = startAngle + charge * Math.PI * 2;
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, startAngle, endAngle);
+    ctx.strokeStyle = `hsla(${hue}, 90%, 70%, ${0.3 + charge * 0.5})`;
+    ctx.lineWidth = 2 + charge * 3;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    // Glow
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, startAngle, endAngle);
+    ctx.strokeStyle = `hsla(${hue}, 90%, 70%, ${charge * 0.2})`;
+    ctx.lineWidth = 8 + charge * 6;
+    ctx.stroke();
+  }
+
+  requestAnimationFrame(animate);
+})();
+</script>
+</body>
+</html>
